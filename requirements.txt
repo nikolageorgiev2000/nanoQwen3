@@ -1,0 +1,9 @@
+torch
+numpy
+transformers
+datasets
+tiktoken
+wandb
+tqdm
+datasets==2.14.0
+pyarrow==20.00.0

@@ -41,8 +41,9 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        # TURNING OFF FLASH ATTENTION FOR NOW
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = False # hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
@@ -66,8 +67,13 @@ class CausalSelfAttention(nn.Module):
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            # concat a ones vector to the attention matrix before softmax to resolve the off-by-one attention issue
+            ones_vector = torch.ones(B, self.n_head, T, 1, device=att.device, dtype=att.dtype)
+            att = torch.cat([att, ones_vector], dim=-1)
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
+            # remove the last attention score (corresponding to the constant 1) before matrix multiplication
+            att = att[:, :, :, :-1]  # (B, nh, T, T+1) -> (B, nh, T, T)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
