@@ -76,15 +76,17 @@ class CausalSelfAttention(nn.Module):
             expected_value = 0.4 # ~3 std for distribution of dot product of two random unit vectors
             return x + (torch.where((x > -expected_value) & (x < expected_value), torch.zeros_like(x), x) - x).detach()
         att = F.sigmoid(att) # straight_through_estimator(att)
-        assert torch.all((att >= -1) & (att <= 1)), "Attention values out of range [-1, 1]"
+        # assert torch.all((att >= 0) & (att <= 1)), "Attention values out of range [0, 1]"
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         # return the sum of the attention values per head
-        att_sum = att.abs().sum(dim=-1)
+        att_sum = att.sum(dim=-1)
+        att_var = (att * (1-att)).sum(dim=-1)
+        # assert torch.all((att_var >= 0) & att_sum >= 0), "Attention variance and sum out of range [0, 1]"
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y, att_sum
+        return y, att_sum, att_var
 
 class MLP(nn.Module):
 
@@ -112,17 +114,18 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        vals, att_sum = self.attn(x)
+        vals, att_sum, att_var = self.attn(x)
         x = x + vals
         x = x + self.mlp(self.ln_2(x))
-        return x, att_sum
+        return x, att_sum, att_var
 
 @dataclass
 class GPTConfig:
+    # NOTE: this does not actually affect the model, these are dummy values
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
-    n_head: int = 1
+    n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -212,9 +215,14 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         att_sums = []
-        for block in self.transformer.h:
-            x, att_sum = block(x)
+        att_vars = []
+        for i, block in enumerate(self.transformer.h):
+            x, att_sum, att_var = block(x)
             att_sums.append(att_sum)
+            att_vars.append(att_var)
+            # print(f"block {i}: att_sum: {att_sum.median():.4f}, att_var: {att_var.median():.4f}")
+            # print(f"block {i}: att_sum: {att_sum.quantile(0.25):.4f}, att_var: {att_var.quantile(0.25):.4f}")
+            # print(f"block {i}: att_sum: {att_sum.quantile(0.75):.4f}, att_var: {att_var.quantile(0.75):.4f}")
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -222,24 +230,23 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-            # Hinge loss on sum of attention values per head
-
             margin = 10.0 # up to 10 close matches ~1.0
-            hingeloss_weight = 1.0  # This can be tuned as a hyperparameter
 
             # Stack attention sums: att_sums: list of (batch, n_head) => (n_layers, batch, n_head)
             att_sums_tensor = torch.vstack(att_sums)  # (n_layers, batch, n_head)
-            # Compute hinge losses: relu(att_sums - margin)
-            hinge_loss_tensor = torch.relu(att_sums_tensor - margin)
-            total_hinge_loss = hinge_loss_tensor.sum()
-
-            loss = ce_loss + hingeloss_weight * total_hinge_loss / (b * t)
+            att_vars_tensor = torch.vstack(att_vars)  # (n_layers, batch, n_head)
+            def approx_gaussian_cdf(x, mu, var):
+                return torch.sigmoid(1.72 * (x - mu) / (torch.sqrt(var) + 1e-1))
+            # Compute sparsity objective
+            sparsity_objective = - approx_gaussian_cdf(margin, att_sums_tensor, att_vars_tensor)
+            total_sparsity_objective = sparsity_objective.sum() / (b * t * self.config.n_head * self.config.n_layer)
+            loss_dict = {'ce_loss': ce_loss, 'sparsity_objective': total_sparsity_objective}
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
-            loss = None
+            loss_dict = None
 
-        return logits, loss
+        return logits, loss_dict
 
     def crop_block_size(self, block_size):
         # model surgery to decrease the block size if necessary
@@ -324,6 +331,7 @@ class GPT(nn.Module):
         ]
         num_decay_params = sum(p.numel() for p in decay_params)
         num_nodecay_params = sum(p.numel() for p in nodecay_params)
+        print(f"number of layers: {self.config.n_layer}")
         print(f"num decayed parameter tensors: {len(decay_params)}, with {num_decay_params:,} parameters")
         print(f"num non-decayed parameter tensors: {len(nodecay_params)}, with {num_nodecay_params:,} parameters")
         # Create AdamW optimizer and use the fused version if it is available

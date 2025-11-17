@@ -23,3 +23,6 @@ log_interval = 10
 
 # weight decay
 weight_decay = 1e-1
+
+n_layer = 4
+n_head = 8

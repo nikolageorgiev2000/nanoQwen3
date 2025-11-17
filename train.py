@@ -217,13 +217,13 @@ def estimate_loss():
     out = {}
     model.eval()
     for split in ['train', 'val']:
-        losses = torch.zeros(eval_iters)
+        losses = torch.zeros(eval_iters, 2)
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
-                logits, loss = model(X, Y)
-            losses[k] = loss.item()
-        out[split] = losses.mean()
+                logits, loss_dict = model(X, Y)
+            losses[k] = torch.tensor([loss_dict['ce_loss'].item(), loss_dict['sparsity_objective'].item()])
+        out[split] = losses.mean(axis=0)
     model.train()
     return out
 
@@ -262,13 +262,15 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        print(f"step {iter_num}: train ce_loss {losses['train'][0]:.4f}, train sparsity_objective {losses['train'][1]:.4f}, val ce_loss {losses['val'][0]:.4f}")
         if wandb_log:
             # Get attention scale values for logging
             log_dict = {
                 "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
+                "train/ce_loss": losses['train'][0],
+                "train/sparsity_objective": losses['train'][1],
+                "val/ce_loss": losses['val'][0],
+                "val/sparsity_objective": losses['val'][1],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
             }
@@ -276,8 +278,9 @@ while True:
             attention_scales = raw_model.get_attention_scales()
             log_dict.update(attention_scales)
             wandb.log(log_dict)
-        if losses['val'] < best_val_loss or always_save_checkpoint:
-            best_val_loss = losses['val']
+        # save the best model by ce_loss
+        if losses['val'][0] < best_val_loss or always_save_checkpoint:
+            best_val_loss = losses['val'][0]
             if iter_num > 0:
                 checkpoint = {
                     'model': raw_model.state_dict(),
@@ -302,7 +305,8 @@ while True:
             # looking at the source of that context manager, it just toggles this variable
             model.require_backward_grad_sync = (micro_step == gradient_accumulation_steps - 1)
         with ctx:
-            logits, loss = model(X, Y)
+            logits, loss_dict = model(X, Y)
+            loss = loss_dict['ce_loss'] + loss_dict['sparsity_objective']
             loss = loss / gradient_accumulation_steps # scale the loss to account for gradient accumulation
         # immediately async prefetch next batch while model is doing the forward pass on the GPU
         X, Y = get_batch('train')
