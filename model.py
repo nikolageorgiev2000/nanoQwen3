@@ -7,10 +7,9 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
-import math
 import inspect
 from dataclasses import dataclass
-
+import math
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
@@ -42,7 +41,7 @@ class CausalSelfAttention(nn.Module):
         self.n_embd = config.n_embd
         self.dropout = config.dropout
         # learned scaling parameter
-        self.scale = nn.Parameter(torch.ones(1) * 5)
+        self.scale = torch.tensor(1.0) # nn.Parameter(torch.ones(1) * 1)
         # TURNING OFF FLASH ATTENTION FOR NOW
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = False # hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -57,32 +56,35 @@ class CausalSelfAttention(nn.Module):
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        head_size = C // self.n_head
+        k = k.view(B, T, self.n_head, head_size).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, head_size).transpose(1, 2) # (B, nh, T, hs)
+        v = v.view(B, T, self.n_head, head_size).transpose(1, 2) # (B, nh, T, hs)
 
         # normalize key and query vectors before attention
-        q = F.normalize(q, p=2, dim=-1, eps=1e-8)
-        k = F.normalize(k, p=2, dim=-1, eps=1e-8)
+        # q = F.normalize(q, p=2, dim=-1, eps=1e-8)
+        # k = F.normalize(k, p=2, dim=-1, eps=1e-8)
+        # v = F.normalize(v, p=2, dim=-1, eps=1e-8)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
-            # efficient attention using Flash Attention CUDA kernels
-            # With normalized q and k, pass learned scale directly to scaled_dot_product_attention
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=self.scale)
-        else:
-            # manual implementation of attention with normalized q and k, using learned scale
-            att = (q @ k.transpose(-2, -1)) * self.scale
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = F.softmax(att, dim=-1)
-            att = self.attn_dropout(att)
-            att = att # (B, nh, T, T+1) -> (B, nh, T, T)
-            y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        att = (q @ k.transpose(-2, -1)) * self.scale
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, -torch.inf)
+        # att = F.softmax(att, dim=-1)
+        # att = self.attn_dropout(att)
+        # round att using a straight-through estimator
+        def straight_through_estimator(x):
+            expected_value = 0.4 # ~3 std for distribution of dot product of two random unit vectors
+            return x + (torch.where((x > -expected_value) & (x < expected_value), torch.zeros_like(x), x) - x).detach()
+        att = F.sigmoid(att) # straight_through_estimator(att)
+        assert torch.all((att >= -1) & (att <= 1)), "Attention values out of range [-1, 1]"
+        y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        # return the sum of the attention values per head
+        att_sum = att.abs().sum(dim=-1)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
-        return y
+        return y, att_sum
 
 class MLP(nn.Module):
 
@@ -110,16 +112,17 @@ class Block(nn.Module):
         self.mlp = MLP(config)
 
     def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+        vals, att_sum = self.attn(x)
+        x = x + vals
         x = x + self.mlp(self.ln_2(x))
-        return x
+        return x, att_sum
 
 @dataclass
 class GPTConfig:
     block_size: int = 1024
     vocab_size: int = 50304 # GPT-2 vocab_size of 50257, padded up to nearest multiple of 64 for efficiency
     n_layer: int = 12
-    n_head: int = 12
+    n_head: int = 1
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
@@ -208,14 +211,29 @@ class GPT(nn.Module):
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
+        att_sums = []
         for block in self.transformer.h:
-            x = block(x)
+            x, att_sum = block(x)
+            att_sums.append(att_sum)
         x = self.transformer.ln_f(x)
 
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+
+            # Hinge loss on sum of attention values per head
+
+            margin = 10.0 # up to 10 close matches ~1.0
+            hingeloss_weight = 1.0  # This can be tuned as a hyperparameter
+
+            # Stack attention sums: att_sums: list of (batch, n_head) => (n_layers, batch, n_head)
+            att_sums_tensor = torch.vstack(att_sums)  # (n_layers, batch, n_head)
+            # Compute hinge losses: relu(att_sums - margin)
+            hinge_loss_tensor = torch.relu(att_sums_tensor - margin)
+            total_hinge_loss = hinge_loss_tensor.sum()
+
+            loss = ce_loss + hingeloss_weight * total_hinge_loss / (b * t)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
