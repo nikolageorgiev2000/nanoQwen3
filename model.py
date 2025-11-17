@@ -41,6 +41,8 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        # learned scaling parameter
+        self.scale = nn.Parameter(torch.ones(1) * 5)
         # TURNING OFF FLASH ATTENTION FOR NOW
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = False # hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -59,21 +61,22 @@ class CausalSelfAttention(nn.Module):
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
+        # normalize key and query vectors before attention
+        q = F.normalize(q, p=2, dim=-1, eps=1e-8)
+        k = F.normalize(k, p=2, dim=-1, eps=1e-8)
+
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
-            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            # With normalized q and k, pass learned scale directly to scaled_dot_product_attention
+            y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True, scale=self.scale)
         else:
-            # manual implementation of attention
-            att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # manual implementation of attention with normalized q and k, using learned scale
+            att = (q @ k.transpose(-2, -1)) * self.scale
             att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            # concat a ones vector to the attention matrix before softmax to resolve the off-by-one attention issue
-            ones_vector = torch.ones(B, self.n_head, T, 1, device=att.device, dtype=att.dtype)
-            att = torch.cat([att, ones_vector], dim=-1)
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
-            # remove the last attention score (corresponding to the constant 1) before matrix multiplication
-            att = att[:, :, :, :-1]  # (B, nh, T, T+1) -> (B, nh, T, T)
+            att = att # (B, nh, T, T+1) -> (B, nh, T, T)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 
@@ -119,7 +122,7 @@ class GPTConfig:
     n_head: int = 12
     n_embd: int = 768
     dropout: float = 0.0
-    bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    bias: bool = False # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
 
 class GPT(nn.Module):
 
@@ -164,6 +167,28 @@ class GPT(nn.Module):
         if non_embedding:
             n_params -= self.transformer.wpe.weight.numel()
         return n_params
+
+    def get_attention_scales(self):
+        """
+        Return a dictionary of attention scale values from all layers.
+        Returns dict with keys like 'attn_scale/layer_0', 'attn_scale/layer_1', etc.
+        Also includes 'attn_scale/mean' and 'attn_scale/std' for aggregated stats.
+        """
+        scales = {}
+        scale_values = []
+        for i, block in enumerate(self.transformer.h):
+            scale_val = block.attn.scale.item()
+            scales[f'attn_scale/layer_{i}'] = scale_val
+            scale_values.append(scale_val)
+        
+        # Add aggregated statistics
+        if scale_values:
+            scales['attn_scale/mean'] = sum(scale_values) / len(scale_values)
+            scales['attn_scale/std'] = math.sqrt(sum((x - scales['attn_scale/mean'])**2 for x in scale_values) / len(scale_values))
+            scales['attn_scale/min'] = min(scale_values)
+            scales['attn_scale/max'] = max(scale_values)
+        
+        return scales
 
     def _init_weights(self, module):
         if isinstance(module, nn.Linear):
