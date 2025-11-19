@@ -21,8 +21,14 @@ eval_interval = 250
 eval_iters = 200
 log_interval = 10
 
-# weight decay
-weight_decay = 1e-1
+learning_rate = 1e-3
+weight_decay = 0
 
-n_layer = 6
-n_head = 8
+n_embd = 1536
+n_layer = 3
+n_head = 1
+bias = False
+dropout = 0.0
+
+# init_from="resume"
+wandb_run_name="gpt2-small-normed-kq-1head-256embd-tanh"

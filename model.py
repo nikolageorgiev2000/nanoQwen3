@@ -106,23 +106,25 @@ class CausalSelfAttention(nn.Module):
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         att = (q @ k.transpose(-2, -1)) * self.scale
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, -torch.inf)
+        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, 0) # set to torch.inf for sigmoid, 0 for tanh
         # att = F.softmax(att, dim=-1)
         # att = self.attn_dropout(att)
         # round att using a straight-through estimator
         def straight_through_estimator(x):
             threshold = 0.1 # selected based on the distribution of the attention weights
             return x + (torch.where(x < threshold, torch.zeros_like(x), x) - x).detach()
-        att = F.sigmoid(att)
+        att = F.tanh(att)
+        att = torch.where(att > 0, att, torch.zeros_like(att)) # set negative values to 0
+        # calculate the sum and variance of the attention weights
+        att_sum = att.sum(dim=-1)
+        att_var = (att * (1-att)).sum(dim=-1)
         if not self.training:
             self.last_att = att.detach()
         att_samples = torch.bernoulli(att)
-        att = att + (att_samples - att).detach() # straight through estimator
+        att = (att + (att_samples - att).detach()) # straight through estimator
 
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         # return the sum of the attention values per head
-        att_sum = att.sum(dim=-1)
-        att_var = (att * (1-att)).sum(dim=-1)
         # assert torch.all((att_var >= 0) & att_sum >= 0), "Attention variance and sum out of range [0, 1]"
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
 

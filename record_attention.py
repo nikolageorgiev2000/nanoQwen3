@@ -61,7 +61,7 @@ def main():
     # iterate layers
     for layer_idx, block in enumerate(model.transformer.h):
         att_module = block.attn
-        att = getattr(att_module, "last_att", None)
+        att = getattr(att_module, "last_att", None).abs()
         if att is None:
             print(f"layer {layer_idx}: no attention matrix recorded, skipping")
             continue
@@ -74,13 +74,30 @@ def main():
         np.savez_compressed(os.path.join(outdir, f"layer{layer_idx}_att.npz"), att=att_cpu)
         B, nh, T, _ = att_cpu.shape
         print(att_cpu.shape)
+        
+        # Create figure with subplots: rows = heads, cols = positions (timesteps)
+        valid_positions = []
         for pos in positions:
-            # support negative positions
             pos_idx = pos if pos >= 0 else T + pos
-            if pos_idx < 0 or pos_idx >= T:
+            if pos_idx >= 0 and pos_idx < T:
+                valid_positions.append((pos, pos_idx))
+            else:
                 print(f"layer {layer_idx}: position {pos} (resolved {pos_idx}) out of range (T={T}), skipping")
-                continue
-            for head in range(nh):
+        
+        if not valid_positions:
+            print(f"layer {layer_idx}: no valid positions, skipping plot")
+            continue
+        
+        n_positions = len(valid_positions)
+        n_heads = nh
+        
+        # Create subplot grid: rows = heads, cols = positions
+        fig, axes = plt.subplots(n_heads, n_positions, 
+                                 figsize=(3 * n_positions, 2.5 * n_heads),
+                                 squeeze=False)
+        
+        for head in range(n_heads):
+            for pos_col, (pos, pos_idx) in enumerate(valid_positions):
                 weights = att_cpu[0, head, pos_idx, :].ravel()
                 # compute simple stats
                 head_stats = {
@@ -94,17 +111,29 @@ def main():
                     "max": float(np.max(weights)),
                 }
                 stats.append(head_stats)
-                # plot histogram
-                plt.figure(figsize=(6, 4))
-                plt.hist(weights, bins=10, color="C0", alpha=0.8)
-                plt.xlim(0, 1)
-                plt.title(f"Layer {layer_idx} Head {head} Pos {pos}")
-                plt.xlabel("Attention weight")
-                plt.ylabel("Count")
-                fn = os.path.join(outdir, f"hist_layer{layer_idx:02d}_head{head:02d}_pos{pos}.png")
-                plt.tight_layout()
-                plt.savefig(fn, dpi=150)
-                plt.close()
+                
+                # plot histogram in subplot
+                ax = axes[head, pos_col]
+                ax.hist(weights, bins=10, color="C0", alpha=0.8)
+                ax.set_xlim(0, 1)
+                ax.set_title(f"Head {head}, Pos {pos}", fontsize=9)
+                
+                # Only add labels on edges
+                if head == n_heads - 1:
+                    ax.set_xlabel("Attn weight", fontsize=8)
+                if pos_col == 0:
+                    ax.set_ylabel("Count", fontsize=8)
+                
+                ax.tick_params(labelsize=7)
+        
+        # Add overall title
+        fig.suptitle(f"Layer {layer_idx} - Attention Weight Distributions", 
+                     fontsize=12, fontweight='bold')
+        
+        fn = os.path.join(outdir, f"hist_layer{layer_idx:02d}.png")
+        plt.tight_layout()
+        plt.savefig(fn, dpi=150)
+        plt.close(fig)
 
     # write stats JSON
     with open(os.path.join(outdir, "attention_stats.json"), "w", encoding="utf-8") as f:
