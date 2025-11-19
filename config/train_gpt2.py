@@ -4,22 +4,34 @@
 
 wandb_log = True
 wandb_project = 'owt'
-wandb_run_name='gpt2-124M'
+wandb_run_name='gpt2-small-normed-kq'
 
 # these make the total batch size be ~0.5M
 # 12 batch size * 1024 block size * 5 gradaccum * 8 GPUs = 491,520
-batch_size = 12
-block_size = 1024
-gradient_accumulation_steps = 5 * 8
+batch_size = 80 # NEW: changed from 12 to 16 since it fits in 12 GB of VRAM
+block_size = 512 # NEW: changed from 1024 to 512 to fit in 12 GB of VRAM
+gradient_accumulation_steps = 6 # NEW: changed from 5 * 8 to 25
+# RESULT: The effective batch size is 16 * 25 = 400 while before it was 12 * 5 * 8 = 480. Should be fine.
 
-# this makes total number of tokens be 300B
-max_iters = 600000
-lr_decay_iters = 600000
+max_iters = 100_000
+lr_decay_iters = 100_000
 
 # eval stuff
-eval_interval = 1000
+eval_interval = 250
 eval_iters = 200
 log_interval = 10
 
-# weight decay
-weight_decay = 1e-1
+# learning_rate = 1e-3
+# weight_decay = 0
+
+# n_embd = 1536
+# n_layer = 3
+# n_head = 1
+# dropout = 0.0
+bias = False
+
+# architecture: [3, 2, 2, 2, 3] -> 12 layers total
+# kv_residual_paths = (None, None, None, None, None, None, None, 4, None, 2, None, None)
+
+# init_from="resume"
+wandb_run_name="gpt2-small-original"
