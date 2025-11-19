@@ -10,9 +10,36 @@ https://github.com/huggingface/transformers/blob/main/src/transformers/models/gp
 import inspect
 from dataclasses import dataclass
 import math
+import os
 import torch
 import torch.nn as nn
 from torch.nn import functional as F
+
+# Debug helper: check for NaN/Inf in tensors (gated by DEBUG_NAN env var)
+DEBUG_NAN = os.environ.get('DEBUG_NAN', '0') == '1'
+if DEBUG_NAN:
+    torch.autograd.set_detect_anomaly(True)
+
+def _check_finite(t, name):
+    """Check if tensor contains NaN or Inf values. Only runs if DEBUG_NAN=1."""
+    if not DEBUG_NAN:
+        return
+    if not torch.isfinite(t).all():
+        finite_mask = torch.isfinite(t)
+        num_bad = (~finite_mask).sum().item()
+        total = t.numel()
+        finite_vals = t[finite_mask]
+        if finite_vals.numel() > 0:
+            nan_count = torch.isnan(finite_vals).sum().item()
+            inf_count = torch.isinf(finite_vals).sum().item()
+            nan_percent = nan_count / finite_vals.numel() * 100
+            inf_percent = inf_count / finite_vals.numel() * 100
+            mean_val = finite_vals.mean().item()
+            min_val = finite_vals.min().item()
+            max_val = finite_vals.max().item()
+        else:
+            mean_val = min_val = max_val = float('nan')
+        raise RuntimeError(f"Non-finite values detected in {name}: {num_bad}/{total} non-finite. stats of finite values -> nan={nan_percent}%, inf={inf_percent}%, mean={mean_val}, min={min_val}, max={max_val}")
 
 class LayerNorm(nn.Module):
     """ LayerNorm but with an optional bias. PyTorch doesn't support simply bias=False """
@@ -40,8 +67,9 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        # learned scaling parameter
-        self.scale = torch.tensor(1.0) # nn.Parameter(torch.ones(1) * 1)
+        # initialize to 1/sqrt(head_size) per common attention scaling
+        head_size = config.n_embd // config.n_head
+        self.register_buffer("scale", torch.tensor(1.0 / math.sqrt(head_size)))
         # TURNING OFF FLASH ATTENTION FOR NOW
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = False # hasattr(torch.nn.functional, 'scaled_dot_product_attention')
@@ -53,9 +81,19 @@ class CausalSelfAttention(nn.Module):
 
     def forward(self, x):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        
+        # Debug: check input to attention
+        _check_finite(x, "x (input to CausalSelfAttention)")
+        
+        # Debug: check c_attn weights
+        _check_finite(self.c_attn.weight, "c_attn.weight")
+        if self.c_attn.bias is not None:
+            _check_finite(self.c_attn.bias, "c_attn.bias")
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        qkv = self.c_attn(x)
+        _check_finite(qkv, "qkv (after c_attn projection)")
+        q, k, v  = qkv.split(self.n_embd, dim=2)
         head_size = C // self.n_head
         k = k.view(B, T, self.n_head, head_size).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, head_size).transpose(1, 2) # (B, nh, T, hs)
@@ -73,10 +111,14 @@ class CausalSelfAttention(nn.Module):
         # att = self.attn_dropout(att)
         # round att using a straight-through estimator
         def straight_through_estimator(x):
-            expected_value = 0.4 # ~3 std for distribution of dot product of two random unit vectors
-            return x + (torch.where((x > -expected_value) & (x < expected_value), torch.zeros_like(x), x) - x).detach()
-        att = F.sigmoid(att) # straight_through_estimator(att)
-        # assert torch.all((att >= 0) & (att <= 1)), "Attention values out of range [0, 1]"
+            threshold = 0.1 # selected based on the distribution of the attention weights
+            return x + (torch.where(x < threshold, torch.zeros_like(x), x) - x).detach()
+        att = F.sigmoid(att)
+        if not self.training:
+            self.last_att = att.detach()
+        att_samples = torch.bernoulli(att)
+        att = att + (att_samples - att).detach() # straight through estimator
+
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
         # return the sum of the attention values per head
         att_sum = att.sum(dim=-1)
@@ -212,12 +254,16 @@ class GPT(nn.Module):
 
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
+        _check_finite(tok_emb, "tok_emb (token embeddings)")
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
+        _check_finite(pos_emb, "pos_emb (position embeddings)")
         x = self.transformer.drop(tok_emb + pos_emb)
+        _check_finite(x, "x (after embeddings + dropout, before blocks)")
         att_sums = []
         att_vars = []
         for i, block in enumerate(self.transformer.h):
             x, att_sum, att_var = block(x)
+            _check_finite(x, f"x (after block {i})")
             att_sums.append(att_sum)
             att_vars.append(att_var)
             # print(f"block {i}: att_sum: {att_sum.median():.4f}, att_var: {att_var.median():.4f}")
@@ -230,16 +276,27 @@ class GPT(nn.Module):
             logits = self.lm_head(x)
             ce_loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
 
-            margin = 10.0 # up to 10 close matches ~1.0
+            margin = 100.0 # up to 10 close matches ~1.0
 
             # Stack attention sums: att_sums: list of (batch, n_head) => (n_layers, batch, n_head)
             att_sums_tensor = torch.vstack(att_sums)  # (n_layers, batch, n_head)
             att_vars_tensor = torch.vstack(att_vars)  # (n_layers, batch, n_head)
+            _check_finite(att_sums_tensor, "att_sums_tensor")
+            _check_finite(att_vars_tensor, "att_vars_tensor")
+            def zeroed_softplus(x, margin, beta):
+                return F.softplus(x - margin, beta) - F.softplus(torch.tensor(-margin), beta)
             def approx_gaussian_cdf(x, mu, var):
-                return torch.sigmoid(1.72 * (x - mu) / (torch.sqrt(var) + 1e-1))
+                # Add epsilon inside sqrt to prevent NaN gradients when var→0
+                # sqrt gradient is 1/(2*sqrt(var)), which explodes if var is tiny
+                return torch.sigmoid(1.72 * (x - mu) / torch.sqrt(var + 1e-2))
+            def hinge_loss(x, margin):
+                return torch.max(margin - x, torch.zeros_like(x))
             # Compute sparsity objective
-            sparsity_objective = - approx_gaussian_cdf(margin, att_sums_tensor, att_vars_tensor)
-            total_sparsity_objective = sparsity_objective.sum() / (b * t * self.config.n_head * self.config.n_layer)
+            sparsity_objective = zeroed_softplus(att_sums_tensor, margin, 0.25) # - approx_gaussian_cdf(margin, att_sums_tensor, att_vars_tensor)
+            _check_finite(sparsity_objective, "sparsity_objective")
+            sparsity_weight = 1e-2
+            total_sparsity_objective = sparsity_weight * sparsity_objective.sum() / (b * t * self.config.n_head * self.config.n_layer)
+            _check_finite(total_sparsity_objective, "total_sparsity_objective")
             loss_dict = {'ce_loss': ce_loss, 'sparsity_objective': total_sparsity_objective}
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
