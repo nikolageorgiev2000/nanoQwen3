@@ -7,6 +7,7 @@ https://github.com/openai/gpt-2/blob/master/src/model.py
 https://github.com/huggingface/transformers/blob/main/src/transformers/models/gpt2/modeling_gpt2.py
 """
 
+from ast import Tuple
 import math
 import inspect
 from dataclasses import dataclass
@@ -30,8 +31,9 @@ class CausalSelfAttention(nn.Module):
 
     def __init__(self, config):
         super().__init__()
-        assert config.n_embd % config.n_head == 0
+        assert config.n_embd % config.n_head == 0, f"n_embd {config.n_embd} must be divisible by n_head {config.n_head}"
         # key, query, value projections for all heads, but in a batch
+        self.n_embed = config.n_embd
         self.c_attn = nn.Linear(config.n_embd, 3 * config.n_embd, bias=config.bias)
         # output projection
         self.c_proj = nn.Linear(config.n_embd, config.n_embd, bias=config.bias)
@@ -49,6 +51,7 @@ class CausalSelfAttention(nn.Module):
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
+        self.stats = None
 
     def forward(self, x, kv_residual=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
@@ -61,18 +64,24 @@ class CausalSelfAttention(nn.Module):
 
         att = (q @ k.transpose(-2, -1)) * self.scale
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+        att_combined = att
         if kv_residual is not None:
             att_residual = (q @ kv_residual[0].transpose(-2, -1)) * self.scale
             att_residual = att_residual.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att = torch.cat([att, att_residual], dim=-1)
-        att = F.softmax(att, dim=-1)
-        att = self.attn_dropout(att)
+            att_combined = torch.cat([att, att_residual], dim=-1)
+        att_combined = F.softmax(att_combined, dim=-1)
+        if not self.training:
+            assert abs(att_combined.sum(dim=-1).mean().item() - 1.0) < 1e-6, f"att_combined sum is {att_combined.sum(dim=-1).mean().item()}"
+            self.stats = (1.0 - att_combined[:, :, :, :self.n_embed].sum(dim=-1).mean()).detach()
+
+        att_combined = self.attn_dropout(att_combined)
         v_combined = v
         if kv_residual is not None:
-            v_combined = torch.cat([v, kv_residual[1]], dim=-1)
-        y = att @ v_combined # (B, nh, T, T) x (B, nh, T, hs_combined) -> (B, nh, T, hs_combined)
+            v_combined = torch.cat([v, kv_residual[1]], dim=-2)
+        y = att_combined @ v_combined # (B, nh, T, T_combined) x (B, nh, T_combined, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         y = self.resid_dropout(self.c_proj(y))
+
         return y, (k, v)
 
 class MLP(nn.Module):
@@ -115,7 +124,7 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
-    kv_residual_paths: tuple[int | None, ...] = (None,) * 12 # The layer index of the residual path for each layer. None means no residual path.
+    kv_residual_paths: tuple[int | None, ...] = tuple() # The layer index of the residual path for each layer. None means no residual path.
 
 class GPT(nn.Module):
 
@@ -155,6 +164,9 @@ class GPT(nn.Module):
         # report number of parameters
         print("number of parameters: %.2fM" % (self.get_num_params()/1e6,))
 
+    def get_attention_stats(self):
+        return [block.attn.stats for block in self.transformer.h]
+
     def get_num_params(self, non_embedding=True):
         """
         Return the number of parameters in the model.
@@ -186,7 +198,8 @@ class GPT(nn.Module):
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
         for i, block in enumerate(self.transformer.h):
-            x, kv = block(x, self.kv_residuals[i])
+            residual = self.kv_residuals[self.kv_residual_paths[i]] if self.kv_residual_paths[i] is not None else None
+            x, kv = block(x, residual)
             if i in self.kv_residual_paths:
                 self.kv_residuals[i] = kv
         x = self.transformer.ln_f(x)

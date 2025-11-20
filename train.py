@@ -66,6 +66,7 @@ decay_lr = True # whether to decay the learning rate
 warmup_iters = 2000 # how many steps to warm up for
 lr_decay_iters = 600000 # should be ~= max_iters per Chinchilla
 min_lr = 6e-5 # minimum learning rate, should be ~= learning_rate/10 per Chinchilla
+kv_residual_paths = (None,) * n_layer
 # DDP settings
 backend = 'nccl' # 'nccl', 'gloo', etc.
 # system
@@ -73,9 +74,10 @@ device = 'cuda' # examples: 'cpu', 'cuda', 'cuda:0', 'cuda:1' etc., or try 'mps'
 dtype = 'bfloat16' if torch.cuda.is_available() and torch.cuda.is_bf16_supported() else 'float16' # 'float32', 'bfloat16', or 'float16', the latter will auto implement a GradScaler
 compile = True # use PyTorch 2.0 to compile the model to be faster
 # -----------------------------------------------------------------------------
-config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str))]
+config_keys = [k for k,v in globals().items() if not k.startswith('_') and isinstance(v, (int, float, bool, str, tuple))]
 exec(open('configurator.py').read()) # overrides from command line or config file
 config = {k: globals()[k] for k in config_keys} # will be useful for logging
+print(f"config: {config}")
 # -----------------------------------------------------------------------------
 
 # various inits, derived attributes, I/O setup
@@ -145,7 +147,7 @@ if os.path.exists(meta_path):
 
 # model init
 model_args = dict(n_layer=n_layer, n_head=n_head, n_embd=n_embd, block_size=block_size,
-                  bias=bias, vocab_size=None, dropout=dropout) # start with model_args from command line
+                  bias=bias, vocab_size=None, dropout=dropout, kv_residual_paths=kv_residual_paths) # start with model_args from command line
 if init_from == 'scratch':
     # init a new model from scratch
     print("Initializing a new model from scratch")
@@ -259,18 +261,25 @@ while True:
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
 
+    log_dict = {
+        "iter": iter_num,
+        "lr": lr,
+        "mfu": running_mfu*100, # convert to percentage
+    }
+
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
+        stats = model.get_attention_stats()
+        for i, stat in enumerate(stats):
+            log_dict[f"train/attn_layer_{i}/res_mass"] = stat.cpu().item()
+        log_dict.update({
+            "train/loss": losses['train'],
+            "val/loss": losses['val'],
+        })
         print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
         if wandb_log:
-            wandb.log({
-                "iter": iter_num,
-                "train/loss": losses['train'],
-                "val/loss": losses['val'],
-                "lr": lr,
-                "mfu": running_mfu*100, # convert to percentage
-            })
+            wandb.log(log_dict)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:
@@ -325,6 +334,10 @@ while True:
             mfu = raw_model.estimate_mfu(batch_size * gradient_accumulation_steps, dt)
             running_mfu = mfu if running_mfu == -1.0 else 0.9*running_mfu + 0.1*mfu
         print(f"iter {iter_num}: loss {lossf:.4f}, time {dt*1000:.2f}ms, mfu {running_mfu*100:.2f}%")
+        # attn_stats = model.get_attention_stats()
+        # for i, stat in enumerate(attn_stats):
+        #     if stat is not None and stat.cpu().item() > 0.0:
+        #         print(f"  Layer {i} res_mass: {stat.item():.4f}")
     iter_num += 1
     local_iter_num += 1
 
