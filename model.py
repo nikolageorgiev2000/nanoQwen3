@@ -45,40 +45,44 @@ class CausalSelfAttention(nn.Module):
         self.dropout = config.dropout
         self.scale = 1.0 / math.sqrt(config.n_embd)
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
-        self.flash = False # hasattr(torch.nn.functional, 'scaled_dot_product_attention')
+        self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
-            self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
-        self.stats = None
+        # causal mask to ensure that attention is only applied to the left in the input sequence
+        self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size)).view(1, 1, config.block_size, config.block_size))
+        self.stats = torch.tensor(0.0)
 
     def forward(self, x, kv_residual=None):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
 
         # calculate query, key, values for all heads in batch and move head forward to be the batch dim
         q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
-        att = (q @ k.transpose(-2, -1)) * self.scale
-        att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-        att_combined = att
-        if kv_residual is not None:
-            att_residual = (q @ kv_residual[0].transpose(-2, -1)) * self.scale
-            att_residual = att_residual.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
-            att_combined = torch.cat([att, att_residual], dim=-1)
-        att_combined = F.softmax(att_combined, dim=-1)
-        if not self.training:
-            assert abs(att_combined.sum(dim=-1).mean().item() - 1.0) < 1e-6, f"att_combined sum is {att_combined.sum(dim=-1).mean().item()}"
-            self.stats = (1.0 - att_combined[:, :, :, :self.n_embed].sum(dim=-1).mean()).detach()
+        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        if self.flash and kv_residual is None:
+            # efficient attention using Flash Attention CUDA kernels
+            y = F.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+        else:
+            att = (q @ k.transpose(-2, -1)) * self.scale
+            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            att_combined = att
+            if kv_residual is not None:
+                att_residual = (q @ kv_residual[0].transpose(-2, -1)) * self.scale
+                att_residual = att_residual.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+                att_combined = torch.cat([att, att_residual], dim=-1)
+            att_combined = F.softmax(att_combined, dim=-1)
+            if not self.training:
+                assert abs(att_combined.sum(dim=-1).mean().item() - 1.0) < 1e-6, f"att_combined sum is {att_combined.sum(dim=-1).mean().item()}"
+                self.stats = (1.0 - att_combined[:, :, :, :self.n_embed].sum(dim=-1).mean()).detach()
 
-        att_combined = self.attn_dropout(att_combined)
-        v_combined = v
-        if kv_residual is not None:
-            v_combined = torch.cat([v, kv_residual[1]], dim=-2)
-        y = att_combined @ v_combined # (B, nh, T, T_combined) x (B, nh, T_combined, hs) -> (B, nh, T, hs)
+            att_combined = self.attn_dropout(att_combined)
+            v_combined = v
+            if kv_residual is not None:
+                v_combined = torch.cat([v, kv_residual[1]], dim=-2)
+            y = att_combined @ v_combined # (B, nh, T, T_combined) x (B, nh, T_combined, hs) -> (B, nh, T, hs)
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         y = self.resid_dropout(self.c_proj(y))
 
